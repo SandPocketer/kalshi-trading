@@ -1,0 +1,7 @@
+__pycache__/
+.pytest_cache/
+.venv/
+*.sqlite3
+*.key
+*.pem
+keys.txt
