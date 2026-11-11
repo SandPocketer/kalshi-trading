@@ -7,6 +7,8 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+from kalshi_experiment import freeze
+
 from kalshi_paper import (
     MIN_DROP, Attempt, Quote, fit_model, performance_summary, read_quotes,
     replay, score_signals, select_threshold, session_diagnostics, split_sessions,
@@ -114,17 +116,86 @@ def arbitrage_panel(path: Path) -> None:
         st.info("Waiting for a basket scan.")
         return
     latest = max(scan["ts_ms"] for scan in scans)
+    latest_by_event = {scan["event_ticker"]: scan for scan in sorted(scans, key=lambda row: row["ts_ms"])}
     rows = [
-        {"Event": scan["event_ticker"], "Status": scan["status"],
+        {"Snapshot UTC": utc_time(scan["ts_ms"]), "Event": scan["event_ticker"], "Status": scan["status"],
          "Ask cost ($)": float(scan["ask_cost"]) if "ask_cost" in scan else None,
          "Assumed fees ($)": float(scan["assumed_fees"]) if "assumed_fees" in scan else None,
          "Net if filled ($)": float(scan["net_if_filled"]) if "net_if_filled" in scan else None,
          "Smallest ask size": float(scan["minimum_ask_size"]) if "minimum_ask_size" in scan else None}
-        for scan in scans if scan["ts_ms"] == latest
+        for scan in latest_by_event.values() if latest - scan["ts_ms"] <= 30_000
     ]
     st.dataframe(rows, hide_index=True, width="stretch")
     st.caption(f"Snapshot {utc_time(latest):%Y-%m-%d %H:%M:%S UTC}. "
                "One Yes contract per range. Net assumes every leg fills at its displayed ask.")
+
+
+def collector_health():
+    st.subheader("Collection health")
+    try:
+        state = json.loads((RECORDINGS / "health.json").read_text(encoding="utf-8"))
+        now = datetime.now(timezone.utc).timestamp() * 1000
+        stale = now - state["updated_ms"] > 30_000
+        st.caption(f"Collector: {'heartbeat stale' if stale else state['status']} · "
+                   f"{state['bytes_stored'] / 1024 ** 2:.2f} / {state['limit_mib']} MiB · "
+                   f"Ends {state['deadline_utc']}")
+        st.dataframe([{"Series": name, "Markets": row.get("markets", 0),
+                       "Seconds since success": round((now - row["last_success_ms"]) / 1000) if row.get("last_success_ms") else None,
+                       "Failures": row["failures"], "Error": row.get("error")}
+                      for name, row in state["series"].items()], hide_index=True)
+    except (OSError, ValueError, KeyError):
+        st.info("No collector heartbeat yet.")
+
+
+def experiment_panel(sessions, demo):
+    st.subheader("Saved experiments")
+    st.caption("Freeze collected data and dates. Saved reports stay unchanged while collection continues. "
+               "Live event dates stay in separate train/test groups; all locations on one date share a group.")
+    destination = Path(__file__).with_name("experiments")
+    if sessions:
+        low = min(qs[0].timestamp for _, qs in sessions)
+        high = max(qs[-1].timestamp for _, qs in sessions)
+        with st.form("freeze_demo" if demo else "freeze_live"):
+            cutoff_text = st.text_input("Training ends (ISO UTC)", utc_time(low + (high - low) * 3 // 5).isoformat())
+            end_text = st.text_input("Test ends (ISO UTC)", utc_time(high).isoformat())
+            submitted = st.form_submit_button("Save experiment report")
+        if submitted:
+            try:
+                times = [datetime.fromisoformat(value) for value in (cutoff_text, end_text)]
+                if any(t.tzinfo is None for t in times):
+                    raise ValueError("Include a timezone, for example +00:00")
+                with st.spinner("Evaluating fixed inputs..."):
+                    folder = freeze(sessions, None if demo else RECORDINGS / "arbitrage.jsonl", destination,
+                                    *(int(t.timestamp() * 1000) for t in times), synthetic=demo)
+                st.success(f"Saved {folder.name}")
+            except (ValueError, OSError) as exc:
+                st.error(str(exc))
+    paths = sorted(destination.glob("*/report.json"), reverse=True)
+    if not paths:
+        st.info("Save an experiment to compare strategies, exposure, execution delays and fees.")
+        return
+    selected = st.selectbox("Saved report", paths, format_func=lambda p: p.parent.name)
+    report = json.loads(selected.read_text(encoding="utf-8"))
+    settings = report["settings"]
+    st.caption(f"{'Synthetic' if settings['synthetic'] else 'Recorded'} · "
+               f"Train through {utc_time(settings['train_end_ms']).isoformat()} · "
+               f"Test through {utc_time(settings['test_end_ms']).isoformat()}")
+    if not report["test_markets"]:
+        st.warning("Insufficient evidence: no held-out quotes in this window. Collect longer and create a new experiment.")
+    st.dataframe([{k: v for k, v in row.items() if k != "events"} for row in report["comparison"]],
+                 hide_index=True, width="stretch")
+    with st.expander("Results by event"):
+        st.dataframe([{"strategy": row["strategy"], "fee": row["fee"], "delay_seconds": row["delay_seconds"], **event}
+                      for row in report["comparison"] for event in row["events"]], hide_index=True)
+    with st.expander("Basket persistence"):
+        st.caption("Counts are quote observations, not fills or profits. Duration is the observed lower bound; "
+                   "gaps over 20 seconds break episodes. Zero delay still checks the next snapshot.")
+        st.dataframe(report["baskets"], hide_index=True)
+    with st.expander("Data quality and assumptions"):
+        st.dataframe(report["diagnostics"], hide_index=True)
+        for note in report["notes"]:
+            st.write(note)
+    st.download_button("Download report JSON", selected.read_bytes(), file_name=f"{selected.parent.name}.json", mime="application/json")
 
 
 @st.fragment(run_every="30s")
@@ -150,11 +221,15 @@ def dashboard(demo: bool, fee: float, tune: bool) -> None:
                 st.warning(f"Could not read {path.name}. {exc}")
         sessions.sort(key=lambda session: session[1][0].timestamp)
 
+    if not demo:
+        collector_health()
+    experiment_panel(sessions, demo)
     st.subheader("Market activity")
     quote_panel(sessions, size)
     if not demo:
         arbitrage_panel(basket_path)
-    st.subheader("Paper performance")
+    st.subheader("Exploratory replay")
+    st.caption("This live preview changes with incoming data. Use Saved experiments for fixed comparisons.")
     try:
         if demo:
             cutoff = len(quotes) * 3 // 5

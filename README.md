@@ -23,9 +23,9 @@ A fresh checkout opens the synthetic demo automatically. No API credentials or c
 
 | File | Responsibility |
 | --- | --- |
-| `kalshi_record.py` | Poll public REST quotes for all open LA temperature ranges and new event dates; save JSONL and basket scans. |
+| `kalshi_record.py` | Poll public REST quotes for all open temperature ranges in selected supported series and new event dates; save JSONL and basket scans. |
 | `kalshi_paper.py` | Validate quotes, replay mean reversion, train and explain a regression filter. |
-| `kalshi_arbitrage.py` | Validate complete LA outcome coverage and calculate basket cost. |
+| `kalshi_arbitrage.py` | Validate complete outcome coverage for LA, New York and Chicago and calculate basket cost. |
 | `kalshi_dashboard.py` | Show quote activity, model decisions, and simulated performance. |
 | `kalshi_live.py` | Receive public trades over an authenticated WebSocket and store them in SQLite. |
 | `kalshi_replay.py` | Replay synthetic trades through the same validation and SQL aggregation. |
@@ -52,7 +52,7 @@ Fees default to an assumed 1 cent per fill or basket leg. Predictions assume fil
 Public quote collection requires no credentials:
 
 ```sh
-python kalshi_record.py --series KXHIGHLAX --hours 72
+python kalshi_record.py --series KXHIGHLAX KXHIGHNY KXHIGHCHI --hours 72
 python kalshi_record.py --scan-once
 python kalshi_paper.py --sessions recordings --diagnostics
 python kalshi_paper.py --sessions recordings --tune --summary-only
@@ -92,4 +92,28 @@ Use `--demo` for sandbox credentials. The WebSocket collector discovers markets 
 python -m unittest -v
 ```
 
-Tests use simulated messages and require no credentials. Next improvements: fixed evaluation windows, open-exposure reporting, and sensitivity to fees and delayed fills. Local databases, recordings, credentials, and virtual environments remain excluded from Git; bundled data is synthetic.
+Tests use simulated messages and require no credentials. Saved experiments now provide fixed windows, open-exposure reporting, and fee/delay comparisons. Local databases, recordings, credentials, and virtual environments remain excluded from Git; bundled data is synthetic.
+
+## Fixed experiments while collection continues
+
+Use **Saved experiments** on the dashboard to choose training and test end timestamps and save a report. Each report stores its own quote/scan snapshot, settings, input checksum, code checksums and model dependency versions under ignored `experiments/`. It remains unchanged when collection grows. Each snapshot consumes additional local disk space outside the collector's recording limit.
+
+```sh
+python kalshi_experiment.py --demo
+python kalshi_experiment.py --train-end 2026-11-11T16:00:00+00:00 --test-end 2026-11-11T17:00:00+00:00
+python kalshi_experiment.py --reproduce experiments/REPLACE_WITH_SAVED_FOLDER
+```
+
+Reproduction verifies unchanged inputs, code and dependency versions and checks exact result equality. Existing reports remain readable after code changes; reproducing an older report requires its original code and dependencies.
+
+For real recordings, the earliest two-thirds of available event dates train the models; all cities on a date stay together. Training quotes stop at the chosen cutoff. Later event dates supply test quotes strictly after that cutoff and through the fixed end. The synthetic example splits one constructed stream by time. The initial 60% time cutoff is just a starting value, not an optimized setting.
+
+Reports compare a fixed 4-cent rule, regression filter, extended regression, and no trades across flat fees of 0/1/2 cents per fill and delays of 0/5/15 seconds. Entry always needs a later quote, even at zero delay. Delayed exits use a quote after the exit trigger plus the delay. Missing entry quotes after 30 seconds are unfilled; unavailable exits remain open. Displayed quotes do not guarantee execution.
+
+Additional model inputs are recent midpoint momentum and bid/ask size imbalance, both known at signal time. Extended regression requires 30 closed training trades. Reports flag fewer than 30 training trades, 30 closed test trades or three tested events as insufficient evidence; meeting these counts is not proof of profitability. Model comparisons are exploratory: selecting a variant from these results requires a fresh test window.
+
+Open exposure includes entry cost and an indicative liquidation P&L after assumed exit fees. Stale marks and insufficient exit size are counted. Closed-trade drawdown still excludes open positions. Market diagnostics show spread, movement and gaps over 20 seconds. Basket reports count candidate observations, episodes, observed duration, and later snapshots retaining positive edge and all-leg size. Gaps over 20 seconds break episodes; repeated observations are not added up as profits.
+
+The collector writes `recordings/health.json` with each series' last success, errors, storage usage and deadline. The dashboard marks an old heartbeat as stale. A failed city request does not block others. All series share the recording limit, checked before every row write.
+
+Fee scenarios are transparent sensitivity assumptions, not a current fee calculator. The exchange's actual fees vary with price and contract rules: [Kalshi fee schedule](https://kalshi.com/docs/kalshi-fee-schedule.pdf). Event discovery uses the [public events API](https://docs.kalshi.com/api-reference/events/get-events). Only verified integer temperature baskets for the three supported series are scanned; other series fail the coverage check.

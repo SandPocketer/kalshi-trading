@@ -5,7 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from kalshi_arbitrage import complete_la_event, scan_basket
+from kalshi_arbitrage import complete_weather_event, scan_basket
 from kalshi_paper import Quote, read_quotes, split_sessions
 
 
@@ -29,9 +29,9 @@ class BasketTests(unittest.TestCase):
         for floor in (79, 81):
             event = deepcopy(self.event)
             event['markets'][1]['floor_strike'] = floor
-            self.assertFalse(complete_la_event(event))
+            self.assertFalse(complete_weather_event(event))
         self.event['markets'].pop()
-        self.assertFalse(complete_la_event(self.event))
+        self.assertFalse(complete_weather_event(self.event))
 
     def test_unavailable_leg_is_not_a_candidate(self):
         self.event['markets'][0]['yes_ask_size_fp'] = '0'

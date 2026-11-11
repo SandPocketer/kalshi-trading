@@ -40,6 +40,8 @@ class Attempt:
     reason: str
     entry: Quote | None = None
     exit: Quote | None = None
+    momentum: float = 0.0
+    imbalance: float = 0.0
 
     @property
     def features(self) -> tuple[float, float]:
@@ -82,7 +84,9 @@ def read_quotes(path: Path, market: str | None, *, live: bool = False) -> tuple[
     return market, quotes
 
 
-def replay(quotes: list[Quote], *, min_drop: float = MIN_DROP) -> list[Attempt]:
+def replay(quotes: list[Quote], *, min_drop: float = MIN_DROP, delay_ms: int = 0) -> list[Attempt]:
+    if delay_ms < 0:
+        raise ValueError("delay must be nonnegative")
     attempts = []
     next_signal = WINDOW
     for index in range(WINDOW, len(quotes)):
@@ -94,26 +98,40 @@ def replay(quotes: list[Quote], *, min_drop: float = MIN_DROP) -> list[Attempt]:
         if signal.timestamp - history[0].timestamp > 60_000 or round(average - signal.midpoint, 10) < min_drop:
             continue
 
+        momentum = history[-1].midpoint - history[0].midpoint
+        total_size = signal.bid_size + signal.ask_size
+        imbalance = (signal.bid_size - signal.ask_size) / total_size if total_size else 0
+        def attempt(reason, entry=None, exit=None):
+            return Attempt(signal, average, reason, entry, exit, momentum, imbalance)
         next_signal = index + 2
         if index + 1 == len(quotes):
-            attempts.append(Attempt(signal, average, "no later quote"))
+            attempts.append(attempt("no later quote"))
             break
-        entry = quotes[index + 1]
+        entry_index = next((i for i in range(index + 1, len(quotes))
+                            if quotes[i].timestamp >= signal.timestamp + delay_ms), None)
+        if entry_index is None:
+            attempts.append(attempt("no quote after execution delay"))
+            break
+        entry = quotes[entry_index]
+        next_signal = entry_index + 1
         if entry.timestamp - signal.timestamp > ENTRY_WAIT_MS or entry.ask_size < 1:
-            attempts.append(Attempt(signal, average, "next ask was late or lacked size"))
+            attempts.append(attempt("next ask was late or lacked size"))
             continue
 
-        for exit_index in range(index + 2, len(quotes)):
+        exit_due = None
+        for exit_index in range(entry_index + 1, len(quotes)):
             quote = quotes[exit_index]
             reverted = quote.midpoint >= average
             expired = quote.timestamp - entry.timestamp >= HOLD_MS
-            if quote.bid_size >= 1 and (reverted or expired):
+            if exit_due is None and (reverted or expired):
+                exit_due = quote.timestamp + delay_ms
                 reason = "mean reached" if reverted else "holding period elapsed"
-                attempts.append(Attempt(signal, average, reason, entry, quote))
+            if exit_due is not None and quote.timestamp >= exit_due and quote.bid_size >= 1:
+                attempts.append(attempt(reason, entry, quote))
                 next_signal = exit_index + 1
                 break
         else:
-            attempts.append(Attempt(signal, average, "position open at end of replay", entry))
+            attempts.append(attempt("position open at end of replay", entry))
             break
     return attempts
 

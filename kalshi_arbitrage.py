@@ -1,13 +1,13 @@
-"""Pure calculations for complete LA weather-event paper baskets."""
+"""Pure calculations for complete weather-event paper baskets."""
 
 from decimal import Decimal
 
 OPEN = {"active", "open"}
 
 
-def complete_la_event(event: dict) -> bool:
+def complete_weather_event(event: dict) -> bool:
     """Validate contiguous integer Fahrenheit ranges including both tails."""
-    if not event["event_ticker"].startswith("KXHIGHLAX-") or not event["mutually_exclusive"]:
+    if event["event_ticker"].split("-")[0] not in {"KXHIGHLAX", "KXHIGHNY", "KXHIGHCHI"} or not event["mutually_exclusive"]:
         return False
     markets = event["markets"]
     if len(markets) < 3 or len({market["ticker"] for market in markets}) != len(markets):
@@ -34,7 +34,7 @@ def complete_la_event(event: dict) -> bool:
 
 def scan_basket(event: dict, fee: Decimal, timestamp: int) -> dict:
     result = {"event_ticker": event["event_ticker"], "ts_ms": timestamp}
-    if not complete_la_event(event):
+    if not complete_weather_event(event):
         return {**result, "status": "unverified coverage"}
     markets = event["markets"]
     if any(market["status"] not in OPEN for market in markets):

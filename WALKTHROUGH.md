@@ -56,3 +56,9 @@ These checks support the main flow. Start by understanding collection, replay, a
 The repository contains the educational strategies and the pipeline. Local recordings and databases stay on disk and are ignored by Git. Only synthetic samples are bundled for visitors.
 
 Next research work: freeze evaluation periods, report open exposure and data gaps, and measure how results change with fees and delayed fills. Keep LA as the initial scope until those comparisons are reproducible.
+
+## Save an experiment — kalshi_experiment.py
+
+`freeze()` saves the inputs available now and the dates you chose. `fixed_split()` puts event dates into training or test groups and removes quotes outside each time window. `evaluate()` repeats the baseline comparison with different fees and execution delays. `exposure()` reports money tied up in open positions and their indicative value. `basket_history()` checks whether a candidate survives to a later snapshot. `reproduce()` checks that the frozen inputs and code reproduce the saved result.
+
+You can continue collecting while reading a saved report. The separate exploratory replay changes as new data arrives; a saved experiment does not. To evaluate newly collected data, create a new experiment.

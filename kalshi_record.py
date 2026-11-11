@@ -50,52 +50,65 @@ def append_row(path: Path, row: dict) -> int:
     return len(data)
 
 
-def record(series: str, directory: Path, hours: float, interval: float,
+def record(series: list[str], directory: Path, hours: float, interval: float,
            fee: Decimal, max_mib: int) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     basket_path = directory / "arbitrage.jsonl"
-    bytes_written = sum(path.stat().st_size for path in directory.glob("*.quotes.jsonl"))
+    bytes_written = sum(p.stat().st_size for p in directory.glob("*.quotes.jsonl"))
     if basket_path.exists():
         bytes_written += basket_path.stat().st_size
     limit = max_mib * 1024 ** 2
     deadline = time.time() + hours * 3600
-    LOG.info("Collecting all open %s markets until %s (limit %d MiB)", series,
-             datetime.fromtimestamp(deadline, timezone.utc).isoformat(timespec="seconds"), max_mib)
-    previous_tickers = set()
-    count = 0
-    while time.time() < deadline and bytes_written < limit:
-        started = time.monotonic()
-        try:
-            events = open_events(series)
-            timestamp = time.time_ns() // 1_000_000
-            markets = [market for event in events for market in event["markets"]
-                       if market["status"] in OPEN]
-            tickers = {market["ticker"] for market in markets}
-            if tickers != previous_tickers:
-                LOG.info("Recording %d open markets across %d events", len(tickers), len(events))
-                previous_tickers = tickers
-            for market in markets:
-                payload = quote_snapshot(market, timestamp)
-                bytes_written += append_row(directory / f"{market['ticker']}.quotes.jsonl", payload)
-                count += 1
-            for event in events:
-                result = scan_basket(event, fee, timestamp)
-                bytes_written += append_row(basket_path, result)
-                if result["status"] == "candidate":
-                    LOG.info("Paper basket candidate %s at $%s net if filled",
-                             result["event_ticker"], result["net_if_filled"])
-            if markets and count % (len(markets) * 60) < len(markets):
-                LOG.info("Saved %d snapshots. Quote and scan storage %.2f MiB",
-                         count, bytes_written / 1024 ** 2)
-        except (OSError, KeyError, TypeError, ValueError, InvalidOperation) as exc:
-            LOG.warning("Missed snapshot: %s", exc)
-        time.sleep(max(0, interval - (time.monotonic() - started)))
-    LOG.info("Finished with %d new snapshots and %.2f MiB stored.", count, bytes_written / 1024 ** 2)
+    health = {"series": {}, "limit_mib": max_mib, "interval_seconds": interval,
+              "deadline_utc": datetime.fromtimestamp(deadline, timezone.utc).isoformat()}
+    LOG.info("Collecting %s until %s; shared limit %d MiB", series, health["deadline_utc"], max_mib)
+    count = cycles = 0
+    full = False
+    try:
+        while time.time() < deadline and not full and bytes_written < limit:
+            started = time.monotonic()
+            for name in series:
+                state = health["series"].setdefault(name, {"failures": 0})
+                try:
+                    events = open_events(name)
+                    timestamp = time.time_ns() // 1_000_000
+                    markets = [m for e in events for m in e["markets"] if m["status"] in OPEN]
+                    rows = [(directory / f"{m['ticker']}.quotes.jsonl", quote_snapshot(m, timestamp)) for m in markets]
+                    rows += [(basket_path, scan_basket(e, fee, timestamp)) for e in events]
+                    for path, row in rows:
+                        row_size = len((json.dumps(row, separators=(",", ":")) + "\n").encode())
+                        if bytes_written + row_size > limit:
+                            full = True
+                            break
+                        bytes_written += append_row(path, row)
+                        count += 1
+                    state.update(last_success_ms=timestamp, markets=len(markets), error=None)
+                except (OSError, KeyError, TypeError, ValueError, InvalidOperation) as exc:
+                    state["failures"] += 1
+                    state["error"] = str(exc)
+                    LOG.warning("%s snapshot failed: %s", name, exc)
+                if full:
+                    break
+            cycles += 1
+            health.update(updated_ms=time.time_ns() // 1_000_000, bytes_stored=bytes_written, status="running")
+            temporary = directory / "health.tmp"
+            temporary.write_text(json.dumps(health), encoding="utf-8")
+            temporary.replace(directory / "health.json")
+            if cycles % 60 == 0:
+                LOG.info("Saved %d rows; %.2f MiB across %d series", count, bytes_written / 1024 ** 2, len(series))
+            time.sleep(min(max(0, deadline - time.time()), max(0, interval - (time.monotonic() - started))))
+    finally:
+        health.update(updated_ms=time.time_ns() // 1_000_000, bytes_stored=bytes_written,
+                      status="storage limit" if full or bytes_written >= limit else "stopped")
+        temporary = directory / "health.tmp"
+        temporary.write_text(json.dumps(health), encoding="utf-8")
+        temporary.replace(directory / "health.json")
+        LOG.info("Collector stopped: %s; %.2f MiB", health["status"], bytes_written / 1024 ** 2)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--series", default="KXHIGHLAX")
+    parser.add_argument("--series", nargs="+", default=["KXHIGHLAX"], help="series tickers separated by spaces")
     parser.add_argument("--directory", type=Path, default=Path("recordings"))
     parser.add_argument("--hours", type=float, default=72)
     parser.add_argument("--interval", type=float, default=5, help="seconds between snapshots")
@@ -114,10 +127,11 @@ def main() -> None:
                         filename=args.log_file, encoding="utf-8" if args.log_file else None)
     try:
         if args.scan_once:
-            for event in open_events(args.series.upper()):
-                print(json.dumps(scan_basket(event, args.fee, time.time_ns() // 1_000_000)))
+            for series in dict.fromkeys(args.series):
+                for event in open_events(series.upper()):
+                    print(json.dumps(scan_basket(event, args.fee, time.time_ns() // 1_000_000)))
         else:
-            record(args.series.upper(), args.directory, args.hours, args.interval, args.fee, args.max_mib)
+            record(list(dict.fromkeys(s.upper() for s in args.series)), args.directory, args.hours, args.interval, args.fee, args.max_mib)
     except KeyboardInterrupt:
         LOG.info("Recording stopped.")
     except (OSError, KeyError, ValueError, InvalidOperation) as exc:
