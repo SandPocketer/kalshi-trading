@@ -1,2 +1,0 @@
-cryptography>=43
-websockets>=16,<17

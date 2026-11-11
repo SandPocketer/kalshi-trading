@@ -2,11 +2,12 @@
 
 import argparse
 from base64 import b64encode
-from contextlib import closing
+from contextlib import closing, nullcontext
 import json
 import logging
 import os
 from pathlib import Path
+from typing import TextIO
 import sqlite3
 import time
 from urllib.parse import urlencode
@@ -62,7 +63,8 @@ def auth_headers(key_id: str, private_key: ed25519.Ed25519PrivateKey | rsa.RSAPr
     }
 
 
-def read_trades(socket: ClientConnection, database: sqlite3.Connection) -> None:
+def read_trades(socket: ClientConnection, database: sqlite3.Connection,
+                quotes: TextIO | None = None) -> None:
     while True:
         try:
             raw_message = socket.recv(timeout=1)
@@ -79,6 +81,11 @@ def read_trades(socket: ClientConnection, database: sqlite3.Connection) -> None:
                 if store_trade(database, trade):
                     LOG.info("Stored %s  %s  %s",
                              trade.trade_id, trade.market_ticker, trade.trade_time_utc)
+            elif message_type == "ticker" and quotes is not None:
+                payload = message.get("msg")
+                if not isinstance(payload, dict):
+                    raise ValueError("expected a ticker payload")
+                print(json.dumps(payload), file=quotes, flush=True)
             elif message_type == "subscribed":
                 LOG.info("Subscribed to public trades. Waiting for new trades.")
             elif message_type == "error":
@@ -89,18 +96,19 @@ def read_trades(socket: ClientConnection, database: sqlite3.Connection) -> None:
 
 def collect(database: sqlite3.Connection, tickers: list[str], key_id: str,
             private_key: ed25519.Ed25519PrivateKey | rsa.RSAPrivateKey, *,
-            url: str = WS_URL) -> None:
+            url: str = WS_URL, quotes: TextIO | None = None) -> None:
     database.execute(CREATE_TRADES)
+    channels = ['trade', 'ticker'] if quotes is not None else ['trade']
     subscription = {
         "id": 1,
         "cmd": "subscribe",
-        "params": {"channels": ["trade"], "market_tickers": tickers},
+        "params": {"channels": channels, "market_tickers": tickers},
     }
     while True:
         try:
             with connect(url, additional_headers=auth_headers(key_id, private_key)) as socket:
                 socket.send(json.dumps(subscription))
-                read_trades(socket, database)
+                read_trades(socket, database, quotes)
         except InvalidStatus as exc:
             status = exc.response.status_code
             if status == 401:
@@ -132,6 +140,7 @@ def main() -> None:
     parser.add_argument("--series", help="subscribe to open markets in this series")
     parser.add_argument("--demo", action="store_true", help="connect to the Kalshi demo environment")
     parser.add_argument("--db", help="SQLite database path")
+    parser.add_argument("--quotes", type=Path, help="append ticker updates to JSONL")
     args = parser.parse_args()
     if bool(args.series) == bool(args.tickers):
         parser.error("provide either --series SERIES_TICKER or one or more market tickers")
@@ -165,9 +174,12 @@ def main() -> None:
     url = DEMO_WS_URL if args.demo else WS_URL
     default_db = "weather_demo.sqlite3" if args.demo else "weather_live.sqlite3"
     db_path = args.db if args.db is not None else default_db
-    with closing(sqlite3.connect(db_path)) as database:
+    if args.quotes and args.quotes.resolve() == Path(db_path).resolve():
+        parser.error("--quotes and --db must use different files")
+    recording = args.quotes.open("a", encoding="utf-8") if args.quotes else nullcontext()
+    with recording as quotes, closing(sqlite3.connect(db_path)) as database:
         try:
-            collect(database, tickers, key_id, private_key, url=url)
+            collect(database, tickers, key_id, private_key, url=url, quotes=quotes)
         except KeyboardInterrupt:
             print_summary(database)
         except RuntimeError as exc:

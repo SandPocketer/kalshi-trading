@@ -5,3 +5,12 @@ __pycache__/
 *.key
 *.pem
 keys.txt
+*.quotes.jsonl
+/recordings/
+
+.env
+.env.*
+.streamlit/secrets.toml
+/private_research/
+
+/dist/
